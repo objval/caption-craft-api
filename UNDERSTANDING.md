@@ -13,7 +13,7 @@ The backend is a **NestJS** application written in **TypeScript**. It follows a 
 - **Job Queue:** **BullMQ** with **Upstash Redis** is used for handling long-running, resource-intensive tasks like video transcription and subtitle burn-in. This ensures the API remains responsive.
 - **Media Processing:**
     - **Cloudinary:** Used for storing and delivering video files and thumbnails.
-    - **FFmpeg:** A powerful multimedia framework used for extracting audio from videos and burning subtitles into them.
+    - **FFmpeg:** A powerful multimedia framework used for extracting audio from videos, burning subtitles into them, and downloading media from URLs.
 - **AI Services:** **OpenAI Whisper API** is used for automatic speech recognition (transcription).
 
 ## 2. Database Schema
@@ -21,7 +21,7 @@ The backend is a **NestJS** application written in **TypeScript**. It follows a 
 The database schema is defined in `schema.sql` and consists of the following tables:
 
 - **`profiles`**: Stores public user data, including their `credits` balance. A new profile is automatically created for each new user via a database trigger.
-- **`videos`**: The central table for video projects. It stores metadata about each video, including its status, Cloudinary IDs, and which transcript to use (`original` or `edited`).
+- **`videos`**: The central table for video projects. It stores metadata about each video, including its status, Cloudinary IDs, which transcript to use (`original` or `edited`), and a `job_error_message` field to store details if a processing job fails.
 - **`transcripts`**: Stores the JSON data for both the original (AI-generated) and the user-edited transcripts.
 - **`credit_packs`**: Defines the purchasable credit packages.
 - **`credit_transactions`**: Logs every change in a user's credit balance for auditing purposes.
@@ -76,6 +76,11 @@ All API endpoints are prefixed with `/v1` and are protected by a global `JwtAuth
         - `CreditGuard(5)`: Deducts 5 credits for this action.
         - `Throttler`: Rate limits burn-in requests to 5 per minute.
 
+- **`POST /:id/retry`**
+    - **Description:** Retries a failed video processing job (either transcription or burn-in). This endpoint checks the video's status and re-queues the appropriate job. It does not deduct additional credits.
+    - **Returns:** The updated `Video` object.
+    - **Guards:** `JwtAuthGuard`
+
 - **`PATCH /:id/active-transcript-type`**
     - **Description:** Toggles whether the burn-in process should use the `original` AI-generated transcript or the `edited` user-modified transcript.
     - **Request Body:** `{ "type": "original" | "edited" }`
@@ -102,21 +107,23 @@ The API offloads heavy tasks to background workers using **BullMQ**.
 ### 4.1. `transcription-queue`
 
 - **Processor:** `TranscriptionProcessor`
-- **Triggered by:** `POST /videos/upload`
+- **Triggered by:** `POST /videos/upload` (initial upload) or `POST /videos/:id/retry` (transcription retry).
 - **Workflow:**
-    1.  Uploads the original video from the `/tmp` directory to **Cloudinary**.
-    2.  Generates a thumbnail URL from the Cloudinary video.
-    3.  Updates the video's status to `processing` in the database.
-    4.  Uses **FFmpeg** to extract the audio into an `.mp3` file.
-    5.  Sends the audio file to the **OpenAI Whisper API** for transcription.
-    6.  Saves the resulting transcript data into the `transcripts` table.
-    7.  Updates the video's status to `ready`. This change is pushed to the frontend via **Supabase Realtime**.
-    8.  Cleans up the temporary video and audio files from the local disk.
+    1.  **Initial Upload:** Receives a `filePath` to a local temporary video file. It uploads this file to Cloudinary and stores the `original_video_cloudinary_id` in the database.
+    2.  **Retry:** If no `filePath` is provided (indicating a retry), it fetches the `original_video_cloudinary_id` from the database and downloads the video directly from Cloudinary to a new local temporary file.
+    3.  Generates a thumbnail URL from the Cloudinary video.
+    4.  Updates the video's status to `processing` in the database.
+    5.  Uses **FFmpeg** to extract the audio into an `.mp3` file.
+    6.  Sends the audio file to the **OpenAI Whisper API** for transcription.
+    7.  Saves the resulting transcript data into the `transcripts` table.
+    8.  Updates the video's status to `ready`. This change is is pushed to the frontend via **Supabase Realtime**.
+    9.  **Error Handling:** If any step fails, the video's status is set to `failed`, and the `job_error_message` field in the `videos` table is populated with the error details.
+    10. Cleans up all local temporary video and audio files.
 
 ### 4.2. `burn-in-queue`
 
 - **Processor:** `BurnInProcessor`
-- **Triggered by:** `POST /videos/:id/burn-in`
+- **Triggered by:** `POST /videos/:id/burn-in` or `POST /videos/:id/retry` (burn-in retry).
 - **Workflow:**
     1.  Fetches the video record and its associated transcript.
     2.  Checks the `active_transcript_type` on the video to decide whether to use the `transcript_data` or `edited_transcript_data`.
@@ -124,7 +131,8 @@ The API offloads heavy tasks to background workers using **BullMQ**.
     4.  Uses **FFmpeg** to burn the subtitles directly onto the video stream, creating a new video file.
     5.  Uploads the final, subtitled video to **Cloudinary**.
     6.  Updates the video record with the `final_video_cloudinary_id` and sets the status to `complete`. This change is pushed to the frontend via **Supabase Realtime**.
-    7.  Cleans up the temporary subtitle and video files.
+    7.  **Error Handling:** If any step fails, the video's status is set to `failed`, and the `job_error_message` field in the `videos` table is populated with the error details.
+    8.  Cleans up the temporary subtitle and video files.
 
 ### 4.3. `cleanup-queue`
 
@@ -133,6 +141,10 @@ The API offloads heavy tasks to background workers using **BullMQ**.
 - **Workflow:**
     - Scans the `/tmp` directory and deletes any files that are older than a certain threshold. This is a crucial housekeeping task to prevent the server's disk from filling up with orphaned temporary files from failed or interrupted jobs.
 
+### 4.4. BullMQ Connection Resilience
+
+- The BullMQ connection to Redis now employs a **custom exponential backoff retry strategy**. Instead of aggressively retrying immediately, it waits for increasing durations (up to 10 seconds) between connection attempts. This prevents log flooding with `ENOTFOUND` errors when the network is temporarily unavailable (e.g., after a computer wakes from sleep) and provides clear, informative log messages during reconnection attempts.
+
 ## 5. Frontend Interaction Strategy
 
 The frontend is expected to interact with the backend in the following manner:
@@ -140,19 +152,20 @@ The frontend is expected to interact with the backend in the following manner:
 1.  **Authentication:** The frontend handles all user authentication (login, signup) directly with `supabase-js`. It is responsible for obtaining and securely storing the JWT.
 2.  **API Requests:** For every request to the NestJS backend, the frontend must include the `Authorization: Bearer <SUPABASE_JWT>` header.
 3.  **Uploads:** The frontend uploads video files to the `/v1/videos/upload` endpoint. It should be prepared to handle a `402 Payment Required` error if the user has insufficient credits.
-4.  **Realtime Updates:** The frontend should open a **Supabase Realtime** subscription to the user's `videos` table. It should listen for `UPDATE` events and reactively update the UI to reflect changes in video `status` (e.g., from `processing` to `ready` to `complete`). This creates a seamless, live user experience without any need for manual page refreshes or HTTP polling.
+4.  **Realtime Updates:** The frontend should open a **Supabase Realtime** subscription to the user's `videos` table. It should listen for `UPDATE` events and reactively update the UI to reflect changes in video `status` (e.g., from `processing` to `ready` to `complete`). It should also monitor the `job_error_message` field to display specific error details to the user if a job fails. This creates a seamless, live user experience without any need for manual page refreshes or HTTP polling.
 5.  **Media Display:** Video thumbnails and final videos are served directly from **Cloudinary**. The backend provides the necessary Cloudinary URLs in its API responses.
-6.  **Editing:** The transcript editor should fetch the video and transcript data from `/v1/videos/:id`. As the user makes changes, it should automatically save them by sending `PUT` requests to `/v1/transcripts/:id`.
+6.  **Editing:** The transcript editor should fetch the video and transcript data from `GET /v1/videos/:id`. As the user makes changes, it should automatically save them by sending `PUT` requests to `/v1/transcripts/:id`.
+7.  **Retries:** If a video enters a `failed` state, the frontend should display the `job_error_message` and offer a "Retry" button that calls the `POST /v1/videos/:id/retry` endpoint.
 
 ## 6. Business Logic & Services
 
 - **`CreditsService`**: Manages user credit balances. It uses a PostgreSQL function `deduct_credits` to ensure atomic credit deductions, preventing race conditions where a user might spend more credits than they have.
-- **`VideosService`**: Orchestrates the entire video lifecycle. It creates video records in the database, dispatches jobs to the appropriate BullMQ queues (`transcription-queue`, `burn-in-queue`), and handles the cleanup of temporary files from the server.
+- **`VideosService`**: Orchestrates the entire video lifecycle. It creates video records in the database, dispatches jobs to the appropriate BullMQ queues (`transcription-queue`, `burn-in-queue`), and handles the cleanup of temporary files from the server. Its `retry` method intelligently determines which job (transcription or burn-in) needs to be re-queued based on the video's state, ensuring that only failed jobs can be retried.
 - **`TranscriptsService`**: A straightforward service responsible for updating the `edited_transcript_data` field in the `transcripts` table when a user saves their changes in the editor.
 - **`CreditGuard`**: A custom NestJS Guard that protects routes requiring credits. It intercepts the request, checks if the `USE_CREDITS` decorator is present, and calls the `CreditsService` to deduct the specified amount *before* the route's main logic is executed. This is a clean and declarative way to handle resource costs.
 
 ### Shared Services
 
 - **`CloudinaryService`**: A wrapper around the Cloudinary Node.js SDK. It abstracts away the details of uploading videos, generating thumbnails, and constructing the correct URLs for accessing media.
-- **`FfmpegService`**: A service that encapsulates the use of the `fluent-ffmpeg` library. It provides methods to perform complex multimedia operations like extracting audio from a video, generating standard `.srt` subtitle files from the transcript data, and burning those subtitles into a new video file.
+- **`FfmpegService`**: A service that encapsulates the use of the `fluent-ffmpeg` library. It provides methods to perform complex multimedia operations like extracting audio from a video, generating standard `.srt` subtitle files from the transcript data, burning those subtitles into a new video file, and **downloading video files from a given URL to a local temporary path**, which is crucial for the retry mechanism.
 - **`OpenaiService`**: A simple service that interacts with the OpenAI API, specifically for sending audio files to the Whisper model for transcription.
