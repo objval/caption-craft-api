@@ -6,6 +6,8 @@ import { promisify } from 'util';
 import { Video } from '../../shared/types';
 import { VideosRepository } from './repositories/videos.repository';
 import { CreateVideoDto } from './dto/video.dto';
+import { JobCacheService } from '../../shared/services/job-cache.service';
+import { CloudinaryService } from '../../shared/services/cloudinary.service';
 
 const unlinkAsync = promisify(fs.unlink);
 
@@ -15,6 +17,8 @@ export class VideosService {
     private readonly videosRepository: VideosRepository,
     @InjectQueue('transcription-queue') private transcriptionQueue: Queue,
     @InjectQueue('burn-in-queue') private burnInQueue: Queue,
+    private readonly jobCacheService: JobCacheService,
+    private readonly cloudinaryService: CloudinaryService,
   ) {}
 
   async create(
@@ -30,21 +34,25 @@ export class VideosService {
 
     const video = await this.videosRepository.create(createVideoDto);
 
-    await this.transcriptionQueue.add(
+    // Use job cache to batch and optimize job creation
+    await this.jobCacheService.addJobWithCache(
+      this.transcriptionQueue,
       'transcribe',
       { videoId: video.id, filePath },
-      { removeOnComplete: true, removeOnFail: false },
+      { removeOnComplete: 1, removeOnFail: 1 },
     );
 
     return video;
   }
 
   async findAll(userId: string): Promise<Video[]> {
-    return this.videosRepository.findAll(userId);
+    const videos = await this.videosRepository.findAll(userId);
+    return videos.map(video => this.enrichVideoWithUrls(video));
   }
 
   async findOne(id: string, userId: string): Promise<Video> {
-    return this.videosRepository.findOne(id, userId);
+    const video = await this.videosRepository.findOne(id, userId);
+    return this.enrichVideoWithUrls(video);
   }
 
   async delete(id: string, userId: string): Promise<void> {
@@ -52,10 +60,11 @@ export class VideosService {
   }
 
   async addBurnInJob(videoId: string): Promise<void> {
-    await this.burnInQueue.add(
+    await this.jobCacheService.addJobWithCache(
+      this.burnInQueue,
       'burn-in',
       { videoId },
-      { removeOnComplete: true, removeOnFail: false },
+      { removeOnComplete: 1, removeOnFail: 1 },
     );
   }
 
@@ -81,10 +90,11 @@ export class VideosService {
       await this.addBurnInJob(video.id);
     } else {
       // If no original video, it means transcription failed
-      await this.transcriptionQueue.add(
+      await this.jobCacheService.addJobWithCache(
+        this.transcriptionQueue,
         'transcribe',
         { videoId: video.id }, // No filePath needed, processor will download from Cloudinary
-        { removeOnComplete: true, removeOnFail: false },
+        { removeOnComplete: 1, removeOnFail: 1 },
       );
     }
 
@@ -103,11 +113,55 @@ export class VideosService {
     );
   }
 
+  async updateTranscript(
+    videoId: string,
+    userId: string,
+    transcriptData: any,
+    version: 'original' | 'edited' = 'edited',
+  ): Promise<Video> {
+    return this.videosRepository.updateTranscript(
+      videoId,
+      userId,
+      transcriptData,
+      version,
+    );
+  }
+
+  async updateCaptionStyle(
+    videoId: string,
+    userId: string,
+    captionStyle: any,
+  ): Promise<Video> {
+    return this.videosRepository.updateCaptionStyle(
+      videoId,
+      userId,
+      captionStyle,
+    );
+  }
+
   async deleteTempFile(filePath: string): Promise<void> {
     try {
       await unlinkAsync(filePath);
     } catch (error) {
       console.error(`Failed to delete temporary file ${filePath}:`, error);
     }
+  }
+
+  private enrichVideoWithUrls(video: Video): Video {
+    const enrichedVideo = { ...video };
+    
+    // Add full URLs for original video
+    if (video.original_video_cloudinary_id) {
+      enrichedVideo.original_video_url = this.cloudinaryService.generateVideoUrl(video.original_video_cloudinary_id);
+    }
+    
+    // Add full URLs for final video
+    if (video.final_video_cloudinary_id) {
+      enrichedVideo.final_video_url = this.cloudinaryService.generateVideoUrl(video.final_video_cloudinary_id);
+      // Also add burned_video_url for backwards compatibility
+      enrichedVideo.burned_video_url = enrichedVideo.final_video_url;
+    }
+    
+    return enrichedVideo;
   }
 }

@@ -1,6 +1,6 @@
 // Upload Configuration
 export const UPLOAD_CONFIG = {
-  MAX_FILE_SIZE: 250 * 1024 * 1024, // 250 MB
+  MAX_FILE_SIZE: 500 * 1024 * 1024, // 500 MB (increased from 250MB)
   ALLOWED_MIME_TYPES: [
     'video/mp4',
     'video/avi',

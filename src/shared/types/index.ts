@@ -15,6 +15,12 @@ export interface Video {
   created_at?: string;
   transcripts?: Transcript[];
   active_transcript_type?: 'original' | 'edited';
+  caption_style?: any; // JSONB field for caption styling options
+  
+  // Additional URL fields for frontend convenience
+  original_video_url?: string;
+  final_video_url?: string;
+  burned_video_url?: string; // Alias for final_video_url for backwards compatibility
 }
 
 export interface Transcript {

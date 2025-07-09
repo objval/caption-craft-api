@@ -2,7 +2,7 @@
 # Ideal Frontend for CaptionCraft
 
 This document outlines the ideal architecture, user flows, and component structure for the CaptionCraft web application. The goal is to fully leverage the powerful, reactive backend API and Supabase features to create a seamless and intuitive user experience.
-
+The api route is https://superbstore.lol
 ## 1. Core Philosophy: A Reactive & Optimistic UI
 
 The frontend should be built with a **reactive-first mindset**. Thanks to the backend's use of Supabase Realtime on the `videos` table, we can create a user interface that updates instantly without requiring manual refreshes or constant polling. The UI should also be **optimistic** where appropriate, assuming that operations will succeed and immediately reflecting changes in the UI while the backend processes the request in the background.

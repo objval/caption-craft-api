@@ -7,9 +7,10 @@ import { QueuesModule } from '../queues/queues.module';
 import { VideoValidationService } from './services/video-validation.service';
 import { VideoUploadInterceptor } from './interceptors/video-upload.interceptor';
 import { VideosRepository } from './repositories/videos.repository';
+import { SharedModule } from '../../shared/shared.module';
 
 @Module({
-  imports: [DatabaseModule, CreditsModule, QueuesModule],
+  imports: [DatabaseModule, CreditsModule, QueuesModule, SharedModule],
   controllers: [VideosController],
   providers: [
     VideosService,

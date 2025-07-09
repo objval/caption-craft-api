@@ -4,8 +4,10 @@ import { Logger } from '@nestjs/common';
 import { CloudinaryService } from '../../shared/services/cloudinary.service';
 import { FfmpegService } from '../../shared/services/ffmpeg.service';
 import { DatabaseService } from '../../core/database/database.service';
+import { DEFAULT_TIKTOK_STYLE } from '../../core/config/caption-styles';
 import * as path from 'path';
 import * as os from 'os';
+import * as fs from 'fs';
 
 @Processor('burn-in-queue', { concurrency: 1 })
 export class BurnInProcessor extends WorkerHost {
@@ -32,10 +34,10 @@ export class BurnInProcessor extends WorkerHost {
     const supabase = this.databaseService.getClient(); // Get client here
 
     try {
-      // 1. Fetch video and transcript data, including active_transcript_type
+      // 1. Fetch video and transcript data, including active_transcript_type and caption_style
       const { data: videoData, error: videoError } = await supabase
         .from('videos')
-        .select('original_video_cloudinary_id, active_transcript_type')
+        .select('original_video_cloudinary_id, active_transcript_type, caption_style')
         .eq('id', videoId)
         .single();
       if (videoError) throw videoError;
@@ -61,20 +63,51 @@ export class BurnInProcessor extends WorkerHost {
         );
       }
 
-      // 2. Generate subtitle file (.srt) from transcript data
-      tempSrtPath = path.join(os.tmpdir(), `${videoId}.srt`);
-      await this.ffmpegService.generateSrt(contentToUse, tempSrtPath);
+      // 2. Generate TikTok-style subtitle file (.ass) from transcript data
+      tempSrtPath = path.join(os.tmpdir(), `${videoId}.ass`);
+      const captionStyle = videoRecord.caption_style || DEFAULT_TIKTOK_STYLE;
+      
+      this.logger.log(`Caption style for video ${videoId}:`, JSON.stringify(captionStyle, null, 2));
+      this.logger.log(`Transcript segments count: ${contentToUse.segments.length}`);
+      
+      await this.ffmpegService.generateTikTokStyleAss(
+        contentToUse, 
+        tempSrtPath, 
+        captionStyle
+      );
+      
+      // Check if ASS file was created and log its contents
+      if (fs.existsSync(tempSrtPath)) {
+        const assContent = fs.readFileSync(tempSrtPath, 'utf8');
+        this.logger.log(`ASS file created successfully. First 500 chars: ${assContent.substring(0, 500)}`);
+      } else {
+        this.logger.error(`ASS file was not created at ${tempSrtPath}`);
+      }
 
-      // 3. Burn subtitles onto the video
+      // 3. Burn TikTok-style subtitles onto the video
       const originalVideoUrl = this.cloudinaryService.generateVideoUrl(
         videoRecord.original_video_cloudinary_id,
       );
       tempBurnedVideoPath = path.join(os.tmpdir(), `${videoId}_burned.mp4`);
+      
+      this.logger.log(`Original video URL: ${originalVideoUrl}`);
+      this.logger.log(`Temp burned video path: ${tempBurnedVideoPath}`);
+      this.logger.log(`Content structure - has words: ${!!contentToUse.words}, words count: ${contentToUse.words?.length || 0}`);
+      
+      // For ASS files, we use the burnSubtitles method which applies the file directly
       await this.ffmpegService.burnSubtitles(
         originalVideoUrl,
         tempSrtPath,
-        tempBurnedVideoPath,
+        tempBurnedVideoPath
       );
+      
+      // Check if burned video was created and log its size
+      if (fs.existsSync(tempBurnedVideoPath)) {
+        const stats = fs.statSync(tempBurnedVideoPath);
+        this.logger.log(`Burned video created successfully. Size: ${stats.size} bytes`);
+      } else {
+        this.logger.error(`Burned video was not created at ${tempBurnedVideoPath}`);
+      }
 
       // 4. Upload final burned video to Cloudinary
       const burnedVideoCloudinaryResult =

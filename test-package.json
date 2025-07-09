@@ -1,0 +1,17 @@
+{
+  "name": "captioncraft-api-tests",
+  "version": "1.0.0",
+  "description": "Test script for CaptionCraft API endpoints",
+  "main": "test-api-endpoints.js",
+  "scripts": {
+    "test": "node test-api-endpoints.js",
+    "install-deps": "npm install axios form-data"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "form-data": "^4.0.0"
+  },
+  "keywords": ["api", "testing", "captioncraft"],
+  "author": "CaptionCraft",
+  "license": "MIT"
+}

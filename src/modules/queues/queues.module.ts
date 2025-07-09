@@ -6,6 +6,7 @@ import { SharedModule } from '../../shared/shared.module';
 import { DatabaseModule } from '../../core/database/database.module';
 import { BurnInProcessor } from './burn-in.processor';
 import { CleanupProcessor } from './cleanup.processor';
+import { RedisConnectionPool } from '../../shared/services/redis-pool.service';
 
 @Module({
   imports: [
@@ -14,37 +15,69 @@ import { CleanupProcessor } from './cleanup.processor';
       envFilePath: process.env.NODE_ENV === 'test' ? '.env.test' : '.env',
     }),
     BullModule.forRootAsync({
-      imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => {
-        const redisUrl = configService.get<string>('REDIS_URL');
-        if (!redisUrl) {
-          throw new Error('REDIS_URL is not defined in environment variables.');
-        }
-        const url = new URL(redisUrl);
+      imports: [ConfigModule, SharedModule],
+      useFactory: (configService: ConfigService, redisPool: RedisConnectionPool) => {
+        const logger = new Logger('BullMQ');
+        logger.log('Using shared Redis connection pool for BullMQ');
+        
+        // Use shared connection from pool
+        const sharedConnection = redisPool.getConnection();
+        
         return {
-          connection: {
-            host: url.hostname,
-            port: parseInt(url.port, 10),
-            password: url.password,
-            tls: url.protocol === 'rediss:' ? {} : undefined, // Enable TLS for rediss
-            // Custom retry strategy with exponential backoff
-            retryStrategy: (times: number) => {
-              const logger = new Logger('BullMQ');
-              const delay = Math.min(times * 500, 10000); // Exponential backoff
-              logger.warn(
-                `[QueueModule] Redis connection failed. Retrying in ${delay}ms... (Attempt #${times})`,
-              );
-              return delay;
+          connection: sharedConnection,
+          // Ultra-aggressive queue settings to minimize Redis commands
+          defaultJobOptions: {
+            removeOnComplete: 1, // Keep only 1 completed job (reduced from 10)
+            removeOnFail: 1, // Keep only 1 failed job (reduced from 5)
+            attempts: 2, // Reduced retry attempts
+            delay: 0, // No artificial delay
+            backoff: {
+              type: 'exponential',
+              delay: 10000, // 10 second initial delay
             },
           },
         };
       },
-      inject: [ConfigService],
+      inject: [ConfigService, RedisConnectionPool],
     }),
     BullModule.registerQueue(
-      { name: 'transcription-queue' },
-      { name: 'burn-in-queue' },
-      { name: 'cleanup-queue' }, // Register new cleanup queue
+      { 
+        name: 'transcription-queue',
+        // Queue-specific job options
+        defaultJobOptions: {
+          removeOnComplete: 5,
+          removeOnFail: 3,
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 10000, // 10 second delay for transcription retries
+          },
+        },
+      },
+      { 
+        name: 'burn-in-queue',
+        defaultJobOptions: {
+          removeOnComplete: 5,
+          removeOnFail: 3,
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 8000, // 8 second delay for burn-in retries
+          },
+        },
+      },
+      { 
+        name: 'cleanup-queue',
+        defaultJobOptions: {
+          removeOnComplete: 3,
+          removeOnFail: 2,
+          attempts: 2,
+          backoff: {
+            type: 'exponential',
+            delay: 5000, // 5 second delay for cleanup retries
+          },
+        },
+      },
     ),
     SharedModule,
     DatabaseModule,

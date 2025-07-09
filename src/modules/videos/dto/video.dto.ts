@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsOptional } from 'class-validator';
+import { IsString, IsEnum, IsOptional, IsObject, IsNotEmpty } from 'class-validator';
 import { TranscriptType } from '../../../shared/types';
 
 export class CreateVideoDto {
@@ -10,6 +10,16 @@ export class CreateVideoDto {
 
   @IsString()
   userId: string;
+}
+
+export class UpdateTranscriptDto {
+  @IsObject()
+  @IsNotEmpty()
+  transcript_data: any;
+
+  @IsEnum(['original', 'edited'])
+  @IsOptional()
+  version?: 'original' | 'edited';
 }
 
 export class UpdateVideoDto {
